@@ -320,6 +320,11 @@ AUTO_LB_CHANNEL_ID = 1455385042044846242
 AUTO_LB_PING_ROLE_ID = 1457931098171506719  # 🏆 Role to ping at 11:55 for leaderboard announcement
 TODO_CHANNEL_ID = 1458400694682783775
 ROLE_ID = 1458400797133115474
+ACCESS_PANEL_CHANNEL_ID = 1455815424267518086
+ACCESS_GRANTED_ROLE_ID = 1457931098171506719
+ACCESS_WELCOME_CHANNEL_ID = 1456959255742775437
+ACCESS_PANEL_BUTTON_CUSTOM_ID = "legendstar:get-access:v1"
+ACCESS_PANEL_EMBED_MARKER = "legendstar-access-panel-v1"
 print(f"GUILD_ID from env: {GUILD_ID}")  # DEBUG: Check if set correctly
 # Excluded voice channel ID: do not record cam on/off minutes for this VC
 EXCLUDED_VOICE_CHANNEL_ID = 1466076240111992954
@@ -894,6 +899,312 @@ GUILD = discord.Object(id=GUILD_ID) if GUILD_ID > 0 else None
 # In-memorys
 vc_join_times = {}
 cam_timers = {}
+access_panel_view_registered = False
+
+
+# ==================== INDEPENDENT ACCESS PANEL SYSTEM ====================
+def get_access_panel_embed(guild=None):
+    embed = discord.Embed(
+        title="Get Access",
+        description=(
+            "Click the button below to unlock your server access instantly.\n\n"
+            "This panel grants the access role, sends a welcome DM, and posts a public confirmation."
+        ),
+        color=discord.Color.from_rgb(46, 204, 113),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(
+        name="What This Does",
+        value=(
+            "• Assigns your access role automatically\n"
+            "• Sends a professional welcome DM\n"
+            "• Posts a timed public welcome message"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Note",
+        value="If your DMs are disabled, your access will still be granted successfully.",
+        inline=False,
+    )
+    if guild and guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    embed.set_footer(text=ACCESS_PANEL_EMBED_MARKER)
+    return embed
+
+
+def get_access_success_embed(member, role, dm_sent, public_sent):
+    embed = discord.Embed(
+        title="Access Granted",
+        description=f"{member.mention}, your access has been activated successfully.",
+        color=discord.Color.from_rgb(88, 101, 242),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="Role Added", value=role.mention, inline=False)
+    embed.add_field(
+        name="Direct Message",
+        value="Welcome DM sent." if dm_sent else "Access granted, but I could not deliver your DM.",
+        inline=False,
+    )
+    embed.add_field(
+        name="Public Welcome",
+        value="Welcome message posted." if public_sent else "Access granted, but the public welcome message could not be posted.",
+        inline=False,
+    )
+    return embed
+
+
+def get_access_dm_embed(member, role):
+    guild = member.guild
+    embed = discord.Embed(
+        title=f"Welcome to {guild.name}",
+        description=(
+            f"Hello {member.mention},\n\n"
+            "Your server access has been approved and your onboarding is now complete."
+        ),
+        color=discord.Color.from_rgb(52, 152, 219),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(
+        name="Unlocked Access",
+        value=f"You now have access to member areas with the role {role.mention}.",
+        inline=False,
+    )
+    embed.add_field(
+        name="Welcome",
+        value=f"We are glad to have you in **{guild.name}**. Please review the server guidance and community expectations when you have a moment.",
+        inline=False,
+    )
+    embed.add_field(
+        name="Support",
+        value="If you need any help, please contact the server staff or use the support system available in the server.",
+        inline=False,
+    )
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    embed.set_footer(text=f"{guild.name} Access System")
+    return embed
+
+
+def get_access_public_embed(member, role):
+    embed = discord.Embed(
+        title="New Access Confirmed",
+        description=f"{member.mention} has successfully received access.\n\nRole granted: {role.mention}",
+        color=discord.Color.from_rgb(241, 196, 15),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(
+        name="Status",
+        value="Access has been granted successfully. Welcome aboard.",
+        inline=False,
+    )
+    embed.set_footer(text="This message will be removed automatically.")
+    return embed
+
+
+def get_access_bot_member(guild):
+    return guild.me or guild.get_member(bot.user.id if bot.user else 0)
+
+
+def validate_access_role_setup(guild, role):
+    bot_member = get_access_bot_member(guild)
+    if bot_member is None:
+        return False, "I could not verify my member profile in this server."
+
+    if not bot_member.guild_permissions.manage_roles:
+        return False, "I need the `Manage Roles` permission to grant access."
+
+    if role is None:
+        return False, f"Access role `{ACCESS_GRANTED_ROLE_ID}` was not found."
+
+    if role.managed:
+        return False, "That access role is managed by an integration and cannot be assigned manually."
+
+    if role >= bot_member.top_role:
+        return False, "My role is not high enough to assign the configured access role."
+
+    return True, None
+
+
+def can_send_message_in_channel(channel, guild):
+    bot_member = get_access_bot_member(guild)
+    if bot_member is None:
+        return False, "I could not verify my channel permissions."
+
+    permissions = channel.permissions_for(bot_member)
+    if not permissions.view_channel:
+        return False, f"I cannot view {channel.mention}."
+    if not permissions.send_messages:
+        return False, f"I cannot send messages in {channel.mention}."
+    if not permissions.embed_links:
+        return False, f"I need the `Embed Links` permission in {channel.mention}."
+
+    return True, None
+
+
+def is_access_panel_message(message):
+    if message.author.id != (bot.user.id if bot.user else 0):
+        return False
+
+    for embed in message.embeds:
+        footer = getattr(embed, "footer", None)
+        if footer and footer.text == ACCESS_PANEL_EMBED_MARKER:
+            return True
+
+    for row in message.components:
+        for component in getattr(row, "children", []):
+            if getattr(component, "custom_id", None) == ACCESS_PANEL_BUTTON_CUSTOM_ID:
+                return True
+
+    return False
+
+
+async def find_existing_access_panel(channel):
+    try:
+        async for message in channel.history(limit=50):
+            if is_access_panel_message(message):
+                return message
+    except Exception as e:
+        print(f"⚠️ Access panel history check failed: {e}")
+    return None
+
+
+async def send_access_welcome_dm(member, role):
+    try:
+        await member.send(embed=get_access_dm_embed(member, role))
+        print(f"✅ Access DM sent to {member} ({member.id})")
+        return True
+    except discord.Forbidden:
+        print(f"⚠️ Access DM skipped for {member} ({member.id}) - DMs disabled")
+        return False
+    except Exception as e:
+        print(f"⚠️ Access DM failed for {member} ({member.id}): {e}")
+        return False
+
+
+async def send_access_public_welcome(member, role):
+    channel = member.guild.get_channel(ACCESS_WELCOME_CHANNEL_ID)
+    if channel is None:
+        print(f"⚠️ Access welcome channel {ACCESS_WELCOME_CHANNEL_ID} not found")
+        return False
+
+    allowed, reason = can_send_message_in_channel(channel, member.guild)
+    if not allowed:
+        print(f"⚠️ {reason}")
+        return False
+
+    try:
+        await channel.send(
+            content=member.mention,
+            embed=get_access_public_embed(member, role),
+            delete_after=30,
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+        )
+        print(f"✅ Access welcome message sent for {member} ({member.id})")
+        return True
+    except Exception as e:
+        print(f"⚠️ Access welcome message failed for {member} ({member.id}): {e}")
+        return False
+
+
+async def send_access_panel_message(channel):
+    existing_panel = await find_existing_access_panel(channel)
+    if existing_panel:
+        return False, existing_panel
+
+    await channel.send(
+        embed=get_access_panel_embed(channel.guild),
+        view=AccessPanelView(),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+    print(f"✅ Access panel sent to #{channel.name} ({channel.id})")
+    return True, None
+
+
+async def register_access_panel_view():
+    global access_panel_view_registered
+
+    if access_panel_view_registered:
+        return
+
+    try:
+        bot.add_view(AccessPanelView())
+        access_panel_view_registered = True
+        print("✅ Persistent AccessPanelView registered")
+    except Exception as e:
+        print(f"⚠️ Error registering AccessPanelView: {e}")
+
+
+class AccessPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Get Access",
+        style=discord.ButtonStyle.success,
+        emoji="✨",
+        custom_id=ACCESS_PANEL_BUTTON_CUSTOM_ID,
+    )
+    async def get_access(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None:
+            return await interaction.response.send_message(
+                "❌ This button can only be used inside the server.",
+                ephemeral=True,
+            )
+
+        if interaction.channel_id != ACCESS_PANEL_CHANNEL_ID:
+            return await interaction.response.send_message(
+                "❌ This access button is only valid in the configured access channel.",
+                ephemeral=True,
+            )
+
+        member = interaction.user if isinstance(interaction.user, discord.Member) else interaction.guild.get_member(interaction.user.id)
+        if member is None:
+            return await interaction.response.send_message(
+                "❌ I could not resolve your server member record. Please try again.",
+                ephemeral=True,
+            )
+
+        role = interaction.guild.get_role(ACCESS_GRANTED_ROLE_ID)
+        is_valid, error_message = validate_access_role_setup(interaction.guild, role)
+        if not is_valid:
+            return await interaction.response.send_message(f"❌ {error_message}", ephemeral=True)
+
+        if role in member.roles:
+            print(f"ℹ️ Duplicate access prevented for {member} ({member.id})")
+            return await interaction.response.send_message(
+                "ℹ️ You already have access. No changes were needed.",
+                ephemeral=True,
+            )
+
+        await interaction.response.defer(ephemeral=True, thinking=False)
+
+        try:
+            await member.add_roles(
+                role,
+                reason=f"Access granted via access panel for {member} ({member.id})",
+            )
+            print(f"✅ Access role granted to {member} ({member.id})")
+        except discord.Forbidden:
+            print(f"⚠️ Missing permissions to grant access role to {member} ({member.id})")
+            return await interaction.followup.send(
+                "❌ I do not have permission to assign the access role.",
+                ephemeral=True,
+            )
+        except Exception as e:
+            print(f"⚠️ Failed to grant access role to {member} ({member.id}): {e}")
+            return await interaction.followup.send(
+                "❌ Something went wrong while granting access. Please contact staff.",
+                ephemeral=True,
+            )
+
+        dm_sent = await send_access_welcome_dm(member, role)
+        public_sent = await send_access_public_welcome(member, role)
+
+        await interaction.followup.send(
+            embed=get_access_success_embed(member, role, dm_sent, public_sent),
+            ephemeral=True,
+        )
 
 
 async def start_camera_enforcement_for(member: discord.Member, channel: discord.VoiceChannel):
@@ -4442,6 +4753,50 @@ async def manual_sync(ctx):
     except Exception as e:
         await ctx.send(f"Sync failed: {e}")
 
+
+@bot.command(name="accesspanel")
+@commands.guild_only()
+@commands.has_permissions(administrator=True)
+async def accesspanel(ctx):
+    target_channel = ctx.guild.get_channel(ACCESS_PANEL_CHANNEL_ID)
+    if target_channel is None:
+        try:
+            fetched_channel = await bot.fetch_channel(ACCESS_PANEL_CHANNEL_ID)
+            if fetched_channel.guild.id != ctx.guild.id:
+                return await ctx.send("❌ The configured access panel channel is not in this server.")
+            target_channel = fetched_channel
+        except Exception as e:
+            print(f"⚠️ Failed to resolve access panel channel: {e}")
+            return await ctx.send(f"❌ Access panel channel `{ACCESS_PANEL_CHANNEL_ID}` could not be found.")
+
+    allowed, reason = can_send_message_in_channel(target_channel, ctx.guild)
+    if not allowed:
+        return await ctx.send(f"❌ {reason}")
+
+    try:
+        sent, existing_panel = await send_access_panel_message(target_channel)
+        if not sent and existing_panel:
+            return await ctx.send(f"ℹ️ Access panel already exists: {existing_panel.jump_url}")
+
+        await ctx.send(f"✅ Access panel deployed in {target_channel.mention}.")
+    except Exception as e:
+        print(f"⚠️ Access panel deployment failed: {e}")
+        await ctx.send("❌ Failed to deploy the access panel. Check console logs for details.")
+
+
+@accesspanel.error
+async def accesspanel_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ Only administrators can use `!accesspanel`.")
+        return
+
+    if isinstance(error, commands.NoPrivateMessage):
+        await ctx.send("❌ `!accesspanel` can only be used inside the server.")
+        return
+
+    print(f"⚠️ accesspanel command error: {error}")
+    await ctx.send("❌ An unexpected error occurred while processing `!accesspanel`.")
+
 # ==================== LOCKDOWN CONTROL ====================
 @tree.command(name="control", description="Open Legend Star Control Panel", guild=GUILD)
 async def control(interaction: discord.Interaction):
@@ -4550,6 +4905,8 @@ async def on_ready():
         print("✅ Persistent ControlPanel view added")
     except Exception as e:
         print(f"⚠️ Error adding ControlPanel view: {e}")
+
+    await register_access_panel_view()
 
     # Initialize SQLite spy database
     await init_spy_db()
