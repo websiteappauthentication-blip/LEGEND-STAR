@@ -4754,48 +4754,42 @@ async def manual_sync(ctx):
         await ctx.send(f"Sync failed: {e}")
 
 
-@bot.command(name="accesspanel")
-@commands.guild_only()
-@commands.has_permissions(administrator=True)
-async def accesspanel(ctx):
-    target_channel = ctx.guild.get_channel(ACCESS_PANEL_CHANNEL_ID)
+@tree.command(name="accesspanel", description="Deploy the access panel for new members", guild=GUILD)
+async def accesspanel(interaction: discord.Interaction):
+    # Check administrator permissions
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message(
+            "❌ Only administrators can use this command.",
+            ephemeral=True,
+        )
+
+    await interaction.response.defer()
+
+    target_channel = interaction.guild.get_channel(ACCESS_PANEL_CHANNEL_ID)
     if target_channel is None:
         try:
-            fetched_channel = await bot.fetch_channel(ACCESS_PANEL_CHANNEL_ID)
-            if fetched_channel.guild.id != ctx.guild.id:
-                return await ctx.send("❌ The configured access panel channel is not in this server.")
+            fetched_channel = await interaction.client.fetch_channel(ACCESS_PANEL_CHANNEL_ID)
+            if fetched_channel.guild.id != interaction.guild.id:
+                return await interaction.followup.send("❌ The configured access panel channel is not in this server.")
             target_channel = fetched_channel
         except Exception as e:
             print(f"⚠️ Failed to resolve access panel channel: {e}")
-            return await ctx.send(f"❌ Access panel channel `{ACCESS_PANEL_CHANNEL_ID}` could not be found.")
+            return await interaction.followup.send(f"❌ Access panel channel `{ACCESS_PANEL_CHANNEL_ID}` could not be found.")
 
-    allowed, reason = can_send_message_in_channel(target_channel, ctx.guild)
+    allowed, reason = can_send_message_in_channel(target_channel, interaction.guild)
     if not allowed:
-        return await ctx.send(f"❌ {reason}")
+        return await interaction.followup.send(f"❌ {reason}")
 
     try:
         sent, existing_panel = await send_access_panel_message(target_channel)
         if not sent and existing_panel:
-            return await ctx.send(f"ℹ️ Access panel already exists: {existing_panel.jump_url}")
+            return await interaction.followup.send(f"ℹ️ Access panel already exists: {existing_panel.jump_url}")
 
-        await ctx.send(f"✅ Access panel deployed in {target_channel.mention}.")
+        await interaction.followup.send(f"✅ Access panel deployed in {target_channel.mention}.")
     except Exception as e:
         print(f"⚠️ Access panel deployment failed: {e}")
-        await ctx.send("❌ Failed to deploy the access panel. Check console logs for details.")
+        await interaction.followup.send("❌ Failed to deploy the access panel. Check console logs for details.")
 
-
-@accesspanel.error
-async def accesspanel_error(ctx, error):
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.send("❌ Only administrators can use `!accesspanel`.")
-        return
-
-    if isinstance(error, commands.NoPrivateMessage):
-        await ctx.send("❌ `!accesspanel` can only be used inside the server.")
-        return
-
-    print(f"⚠️ accesspanel command error: {error}")
-    await ctx.send("❌ An unexpected error occurred while processing `!accesspanel`.")
 
 # ==================== LOCKDOWN CONTROL ====================
 @tree.command(name="control", description="Open Legend Star Control Panel", guild=GUILD)
