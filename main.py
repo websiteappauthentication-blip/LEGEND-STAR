@@ -34,8 +34,22 @@ from dotenv import load_dotenv
 from discord.app_commands import checks
 import socket
 import re
+import sys
 import aiosqlite
 from motor.motor_asyncio import AsyncIOMotorClient
+
+
+def configure_console_output() -> None:
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+configure_console_output()
 
 load_dotenv()
 
@@ -920,6 +934,29 @@ def cancel_camera_enforcement(member_id: int) -> None:
         task.cancel()
 
 
+def get_camera_enforcement_task(member_id: int):
+    task = cam_timers.get(member_id)
+    if task and task.done():
+        cam_timers.pop(member_id, None)
+        print(f"🧹 Cleared stale camera enforcement task for member {member_id}")
+        return None
+    return task
+
+
+def has_active_camera_enforcement(member_id: int) -> bool:
+    return get_camera_enforcement_task(member_id) is not None
+
+
+def track_camera_enforcement_task(member_id: int, task: asyncio.Task) -> asyncio.Task:
+    def _cleanup(finished_task: asyncio.Task) -> None:
+        if cam_timers.get(member_id) is finished_task:
+            cam_timers.pop(member_id, None)
+
+    task.add_done_callback(_cleanup)
+    cam_timers[member_id] = task
+    return task
+
+
 async def get_member_for_enforcement(guild: discord.Guild, member_id: int):
     member = guild.get_member(member_id)
     if member is not None:
@@ -1253,7 +1290,7 @@ async def _startup_camera_enforcement_legacy(member: discord.Member, channel: di
         return
 
     # Avoid duplicate timers
-    if member_id in cam_timers:
+    if has_active_camera_enforcement(member_id):
         return
 
     async def _enforce():
@@ -1360,7 +1397,7 @@ async def _startup_camera_enforcement_legacy(member: discord.Member, channel: di
 
         cam_timers.pop(member_id, None)
 
-    cam_timers[member_id] = bot.loop.create_task(_enforce())
+    track_camera_enforcement_task(member_id, bot.loop.create_task(_enforce()))
 
 
 async def start_camera_enforcement_for(member: discord.Member, channel: discord.VoiceChannel):
@@ -1376,21 +1413,28 @@ async def start_camera_enforcement_for(member: discord.Member, channel: discord.
         print(f"✅ [{member.display_name}] Has CAMERA_BYPASS_ROLE - Enforcement skipped")
         return
 
-    if member_id in cam_timers:
+    if has_active_camera_enforcement(member_id):
         return
 
     async def _enforce():
         try:
+            await asyncio.sleep(1)
             guild = bot.get_guild(guild_id)
             if not guild:
+                print(f"⚠️ Camera enforcement aborted for ID {member_id}: guild cache unavailable")
                 return
 
             member_obj = await get_member_for_enforcement(guild, member_id)
             if not member_obj or not member_obj.voice or not member_obj.voice.channel:
+                print(f"ℹ️ Camera enforcement aborted for ID {member_id}: member is no longer in voice")
                 return
 
             if has_camera_bypass(member_obj):
                 print(f"✅ [{member_obj.display_name}] Gained CAMERA_BYPASS_ROLE - Timer cancelled")
+                return
+
+            if not is_strict_camera_channel(member_obj.voice.channel):
+                print(f"ℹ️ [{member_obj.display_name}] Not in a strict camera channel anymore - timer skipped")
                 return
 
             if member_obj.voice.self_video:
@@ -1484,7 +1528,7 @@ async def start_camera_enforcement_for(member: discord.Member, channel: discord.
         finally:
             cam_timers.pop(member_id, None)
 
-    cam_timers[member_id] = asyncio.create_task(_enforce())
+    track_camera_enforcement_task(member_id, asyncio.create_task(_enforce()))
 user_activity = defaultdict(list)
 spam_cache = defaultdict(list)
 strike_cache = defaultdict(list)
@@ -1928,7 +1972,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             print(f"✅ [{member.display_name}] CAM ON - No warning needed")
         return
 
-    if member.id not in cam_timers:
+    if not has_active_camera_enforcement(member.id):
         status_text = "SCREENSHARE ON" if after.self_stream else "NO SCREENSHARE"
         print(f"⚠️ [{member.display_name}] CAM OFF ({status_text}) - ENFORCEMENT STARTED!")
         await start_camera_enforcement_for(member, after.channel)
@@ -5158,7 +5202,7 @@ async def on_ready():
                                 continue
                             # if camera off and no timer yet, start enforcement
                             has_cam = m.voice.self_video if m.voice else False
-                            if not has_cam and m.id not in cam_timers:
+                            if not has_cam and not has_active_camera_enforcement(m.id):
                                 print(f"🔎 Scheduling startup enforcement for {m.display_name} in {ch.name}")
                                 await start_camera_enforcement_for(m, ch)
                     except Exception:
