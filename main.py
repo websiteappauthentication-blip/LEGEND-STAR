@@ -330,7 +330,11 @@ print(f"GUILD_ID from env: {GUILD_ID}")  # DEBUG: Check if set correctly
 EXCLUDED_VOICE_CHANNEL_ID = 1466076240111992954
 
 # Strict channels
-STRICT_CHANNEL_IDS = {"1428762702414872636", "1455906399262605457", "1455582132218106151", "1427325474551500851", "1428762820585062522"}
+STRICT_CHANNEL_IDS = {1428762702414872636, 1455906399262605457, 1428762820585062522}
+CAMERA_ENFORCEMENT_SECONDS = 180
+
+# Camera bypass role (users with this role bypass camera enforcement)
+CAMERA_BYPASS_ROLE = 1505454225616932955
 
 # Soft automod marker role names (delete-only enforcement)
 NOPING_ROLE = "NoPing"
@@ -902,6 +906,34 @@ cam_timers = {}
 access_panel_view_registered = False
 
 
+def is_strict_camera_channel(channel) -> bool:
+    return bool(channel and channel.id in STRICT_CHANNEL_IDS)
+
+
+def has_camera_bypass(member: discord.Member) -> bool:
+    return any(role.id == CAMERA_BYPASS_ROLE for role in getattr(member, "roles", []))
+
+
+def cancel_camera_enforcement(member_id: int) -> None:
+    task = cam_timers.pop(member_id, None)
+    if task and not task.done():
+        task.cancel()
+
+
+async def get_member_for_enforcement(guild: discord.Guild, member_id: int):
+    member = guild.get_member(member_id)
+    if member is not None:
+        return member
+
+    try:
+        return await guild.fetch_member(member_id)
+    except discord.NotFound:
+        return None
+    except Exception as e:
+        print(f"⚠️ Failed to fetch member {member_id} for camera enforcement: {e}")
+        return None
+
+
 # ==================== INDEPENDENT ACCESS PANEL SYSTEM ====================
 def get_access_panel_embed(guild=None):
     embed = discord.Embed(
@@ -1207,13 +1239,18 @@ class AccessPanelView(discord.ui.View):
         )
 
 
-async def start_camera_enforcement_for(member: discord.Member, channel: discord.VoiceChannel):
+async def _startup_camera_enforcement_legacy(member: discord.Member, channel: discord.VoiceChannel):
     """Start the same enforcement flow used for on_voice_state_update for an existing member.
     This allows enforcement to run for users who were already in VC when the bot started.
     """
     member_id = member.id
     guild_id = member.guild.id
     channel_id = channel.id if channel else None
+
+    # Check for bypass role
+    if any(role.id == CAMERA_BYPASS_ROLE for role in member.roles):
+        print(f"✅ [{member.display_name}] Has CAMERA_BYPASS_ROLE - Enforcement skipped")
+        return
 
     # Avoid duplicate timers
     if member_id in cam_timers:
@@ -1324,6 +1361,130 @@ async def start_camera_enforcement_for(member: discord.Member, channel: discord.
         cam_timers.pop(member_id, None)
 
     cam_timers[member_id] = bot.loop.create_task(_enforce())
+
+
+async def start_camera_enforcement_for(member: discord.Member, channel: discord.VoiceChannel):
+    """Shared camera enforcement scheduler for startup and live voice updates."""
+    if not is_strict_camera_channel(channel):
+        return
+
+    member_id = member.id
+    guild_id = member.guild.id
+
+    if has_camera_bypass(member):
+        cancel_camera_enforcement(member_id)
+        print(f"✅ [{member.display_name}] Has CAMERA_BYPASS_ROLE - Enforcement skipped")
+        return
+
+    if member_id in cam_timers:
+        return
+
+    async def _enforce():
+        try:
+            guild = bot.get_guild(guild_id)
+            if not guild:
+                return
+
+            member_obj = await get_member_for_enforcement(guild, member_id)
+            if not member_obj or not member_obj.voice or not member_obj.voice.channel:
+                return
+
+            if has_camera_bypass(member_obj):
+                print(f"✅ [{member_obj.display_name}] Gained CAMERA_BYPASS_ROLE - Timer cancelled")
+                return
+
+            if member_obj.voice.self_video:
+                print(f"✅ [{member_obj.display_name}] Camera already ON - Timer skipped")
+                return
+
+            try:
+                embed = discord.Embed(
+                    title="CAMERA REQUIRED - FINAL WARNING!",
+                    description=f"{member_obj.mention}\n\n**Please turn on your camera within 3 minutes or you will be disconnected from the voice channel!**",
+                    color=discord.Color.red()
+                )
+                embed.add_field(name="TIME REMAINING", value="3 minutes to comply or automatic kick", inline=False)
+                embed.add_field(name="ACTION REQUIRED", value="Turn on your camera. Screenshare alone is not enough.", inline=False)
+                embed.set_footer(text="This channel has strict camera enforcement enabled")
+                await member_obj.send(embed=embed)
+                print(f"📢 [{member_obj.display_name}] Camera warning sent - 3 minute timer started")
+            except Exception as e:
+                print(f"⚠️ Failed to send enforcement warning to ID {member_id}: {e}")
+
+            await asyncio.sleep(CAMERA_ENFORCEMENT_SECONDS)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            print(f"⚠️ Camera enforcement setup failed for ID {member_id}: {e}")
+            return
+
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            cam_timers.pop(member_id, None)
+            return
+
+        member_ref = await get_member_for_enforcement(guild, member_id)
+        if not member_ref or not member_ref.voice or not member_ref.voice.channel:
+            cam_timers.pop(member_id, None)
+            return
+
+        if has_camera_bypass(member_ref):
+            print(f"✅ [{member_ref.display_name}] Has CAMERA_BYPASS_ROLE at expiry - disconnect skipped")
+            cam_timers.pop(member_id, None)
+            return
+
+        voice_chan = member_ref.voice.channel
+        if member_ref.voice.self_video:
+            print(f"✅ [{member_ref.display_name}] COMPLIED IN TIME - CAM ON detected")
+            cam_timers.pop(member_id, None)
+            return
+
+        if not is_strict_camera_channel(voice_chan):
+            print(f"ℹ️ [{member_ref.display_name}] Left strict camera channel before timer expiry")
+            cam_timers.pop(member_id, None)
+            return
+
+        bot_member = guild.get_member(bot.user.id)
+        if bot_member and voice_chan:
+            perms = voice_chan.permissions_for(bot_member)
+            if not perms.move_members and not perms.administrator:
+                print(f"❌ [ID:{member_id}] BOT LACKS MOVE_MEMBERS permission in {voice_chan.name}")
+                cam_timers.pop(member_id, None)
+                return
+            if member_ref.top_role.position >= bot_member.top_role.position and not perms.administrator:
+                print(f"❌ [ID:{member_id}] Role hierarchy prevents disconnect (member >= bot)")
+                cam_timers.pop(member_id, None)
+                return
+
+        try:
+            print(f"🔄 [ID:{member_id}] Attempting to disconnect for camera enforcement...")
+            await member_ref.move_to(None, reason="Camera enforcement")
+        except Exception as e:
+            print(f"❌ Failed move_to for ID {member_id}: {e}")
+            cam_timers.pop(member_id, None)
+            return
+
+        await asyncio.sleep(2)
+        member_ref = await get_member_for_enforcement(guild, member_id) or member_ref
+        if member_ref.voice and member_ref.voice.channel:
+            print(f"❌ [ID:{member_id}] STILL IN VOICE CHANNEL after move_to")
+            cam_timers.pop(member_id, None)
+            return
+
+        print(f"✅ [ID:{member_id}] Confirmed disconnected")
+        try:
+            embed_dm = discord.Embed(
+                title="You Were Disconnected",
+                description=f"You were disconnected from **{voice_chan.name if voice_chan else 'the voice channel'}** due to camera enforcement.\n\nCamera is mandatory in this channel. Please enable your camera before rejoining.",
+                color=discord.Color.red()
+            )
+            await member_ref.send(embed=embed_dm)
+        except Exception as e:
+            print(f"⚠️ Failed to send disconnect DM to ID {member_id}: {e}")
+        finally:
+            cam_timers.pop(member_id, None)
+
+    cam_timers[member_id] = asyncio.create_task(_enforce())
 user_activity = defaultdict(list)
 spam_cache = defaultdict(list)
 strike_cache = defaultdict(list)
@@ -1739,6 +1900,40 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         except Exception as e:
             print(f"⚠️ Temp channel cleanup check failed: {e}")
 
+    # Camera enforcement handled by shared scheduler below.
+    if not after.channel:
+        if member.id in cam_timers:
+            cancel_camera_enforcement(member.id)
+            print(f"LEFT VC - Camera timer cancelled for {member.display_name}")
+        return
+
+    if not is_strict_camera_channel(after.channel):
+        if member.id in cam_timers:
+            cancel_camera_enforcement(member.id)
+            print(f"Left strict camera channel - Camera timer cancelled for {member.display_name}")
+        return
+
+    if has_camera_bypass(member):
+        if member.id in cam_timers:
+            cancel_camera_enforcement(member.id)
+        print(f"✅ [{member.display_name}] Has CAMERA_BYPASS_ROLE - Enforcement skipped")
+        return
+
+    if after.self_video:
+        if member.id in cam_timers:
+            cancel_camera_enforcement(member.id)
+        if after.self_stream:
+            print(f"✅ [{member.display_name}] CAM ON + SCREENSHARE ON - No warning needed")
+        else:
+            print(f"✅ [{member.display_name}] CAM ON - No warning needed")
+        return
+
+    if member.id not in cam_timers:
+        status_text = "SCREENSHARE ON" if after.self_stream else "NO SCREENSHARE"
+        print(f"⚠️ [{member.display_name}] CAM OFF ({status_text}) - ENFORCEMENT STARTED!")
+        await start_camera_enforcement_for(member, after.channel)
+    return
+
     # Cancel camera timer if user leaves voice channel
     if not after.channel and member.id in cam_timers:
         task = cam_timers.pop(member.id, None)
@@ -1748,6 +1943,11 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     
     channel = after.channel
     if channel and (str(channel.id) in STRICT_CHANNEL_IDS or "Cam On" in channel.name):
+        # Check for bypass role
+        if any(role.id == CAMERA_BYPASS_ROLE for role in member.roles):
+            print(f"✅ [{member.display_name}] Has CAMERA_BYPASS_ROLE - Enforcement skipped")
+            return
+        
         has_cam = after.self_video  # True if camera is on
         has_screenshare = after.self_stream  # True if screensharing
         
@@ -4946,11 +5146,15 @@ async def on_ready():
             if guild:
                 for cid in STRICT_CHANNEL_IDS:
                     try:
-                        ch = guild.get_channel(int(cid))
+                        ch = guild.get_channel(cid)
                         if not ch:
                             continue
                         for m in ch.members:
                             if m.bot:
+                                continue
+                            # Check for bypass role first
+                            if has_camera_bypass(m):
+                                print(f"✅ [{m.display_name}] Has CAMERA_BYPASS_ROLE - Startup enforcement skipped")
                                 continue
                             # if camera off and no timer yet, start enforcement
                             has_cam = m.voice.self_video if m.voice else False
