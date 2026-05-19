@@ -1529,6 +1529,56 @@ async def start_camera_enforcement_for(member: discord.Member, channel: discord.
             cam_timers.pop(member_id, None)
 
     track_camera_enforcement_task(member_id, asyncio.create_task(_enforce()))
+
+
+async def ensure_camera_enforcement_for_guild(guild: discord.Guild, source: str = "watchdog"):
+    """Backstop sweep so camera enforcement still works if a voice-state event is missed."""
+    if guild is None:
+        return
+
+    for member_id in list(cam_timers):
+        task = get_camera_enforcement_task(member_id)
+        if task is None:
+            continue
+
+        member = guild.get_member(member_id)
+        if not member or not member.voice or not member.voice.channel:
+            cancel_camera_enforcement(member_id)
+            print(f"ℹ️ [{source}] Cancelled camera timer for {member_id} - member left voice")
+            continue
+
+        if not is_strict_camera_channel(member.voice.channel):
+            cancel_camera_enforcement(member_id)
+            print(f"ℹ️ [{source}] Cancelled camera timer for {member.display_name} - not in strict channel")
+            continue
+
+        if has_camera_bypass(member):
+            cancel_camera_enforcement(member_id)
+            print(f"✅ [{source}] Cancelled camera timer for {member.display_name} - bypass role detected")
+            continue
+
+        if member.voice.self_video:
+            cancel_camera_enforcement(member_id)
+            print(f"✅ [{source}] Cancelled camera timer for {member.display_name} - camera is now on")
+
+    for channel_id in STRICT_CHANNEL_IDS:
+        channel = guild.get_channel(channel_id)
+        if not isinstance(channel, discord.VoiceChannel):
+            continue
+
+        for member in list(channel.members):
+            if member.bot:
+                continue
+
+            if has_camera_bypass(member):
+                continue
+
+            if member.voice and member.voice.self_video:
+                continue
+
+            if not has_active_camera_enforcement(member.id):
+                print(f"🔎 [{source}] Scheduling camera enforcement for {member.display_name} in {channel.name}")
+                await start_camera_enforcement_for(member, channel)
 user_activity = defaultdict(list)
 spam_cache = defaultdict(list)
 strike_cache = defaultdict(list)
@@ -2144,6 +2194,22 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                     cam_timers.pop(captured_member_id, None)
                 
                 cam_timers[member.id] = bot.loop.create_task(enforce())
+
+@tasks.loop(seconds=30)
+async def strict_camera_enforcement_watchdog():
+    """Periodic backstop for strict camera channels."""
+    if GUILD_ID <= 0:
+        return
+
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        return
+
+    try:
+        await ensure_camera_enforcement_for_guild(guild, source="watchdog")
+    except Exception as e:
+        print(f"⚠️ strict_camera_enforcement_watchdog error: {e}")
+
 
 @tasks.loop(seconds=30)
 async def batch_save_study():
@@ -5166,6 +5232,7 @@ async def on_ready():
         traceback.print_exc()
     
     print(f"\n📊 Starting Background Tasks:")
+    print(f"   🎥 strict_camera_enforcement_watchdog: Every 30 seconds")
     print(f"   🕐 batch_save_study: Every 30 seconds")
     print(f"   📍 auto_leaderboard_ping: Daily at 23:55 IST")
     print(f"   🏆 auto_leaderboard: Daily at 23:55 IST")
@@ -5175,6 +5242,7 @@ async def on_ready():
     print(f"   📋 monitor_audit: Every 1 minute")
     print(f"{'='*70}\n")
     
+    strict_camera_enforcement_watchdog.start()
     batch_save_study.start()
     auto_leaderboard_ping.start()
     auto_leaderboard.start()
@@ -5188,25 +5256,7 @@ async def on_ready():
         if GUILD_ID > 0:
             guild = bot.get_guild(GUILD_ID)
             if guild:
-                for cid in STRICT_CHANNEL_IDS:
-                    try:
-                        ch = guild.get_channel(cid)
-                        if not ch:
-                            continue
-                        for m in ch.members:
-                            if m.bot:
-                                continue
-                            # Check for bypass role first
-                            if has_camera_bypass(m):
-                                print(f"✅ [{m.display_name}] Has CAMERA_BYPASS_ROLE - Startup enforcement skipped")
-                                continue
-                            # if camera off and no timer yet, start enforcement
-                            has_cam = m.voice.self_video if m.voice else False
-                            if not has_cam and not has_active_camera_enforcement(m.id):
-                                print(f"🔎 Scheduling startup enforcement for {m.display_name} in {ch.name}")
-                                await start_camera_enforcement_for(m, ch)
-                    except Exception:
-                        continue
+                await ensure_camera_enforcement_for_guild(guild, source="startup")
     except Exception as e:
         print(f"⚠️ Startup sweep error: {e}")
 
