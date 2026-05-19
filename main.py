@@ -36,6 +36,7 @@ import socket
 import re
 import sys
 import aiosqlite
+from urllib.parse import urlparse, urlunparse
 from motor.motor_asyncio import AsyncIOMotorClient
 
 
@@ -53,18 +54,31 @@ configure_console_output()
 
 load_dotenv()
 
+
+def get_int_env(name: str, default: int) -> int:
+    """Read an integer env var safely and fall back without crashing startup."""
+    raw_value = os.getenv(name)
+    if raw_value is None or raw_value.strip() == "":
+        return default
+
+    try:
+        return int(raw_value)
+    except ValueError:
+        print(f"⚠️ Invalid {name}='{raw_value}' - using fallback {default}")
+        return default
+
 # ==================== CONFIG ====================
 TOKEN = os.getenv("DISCORD_TOKEN")
 CLIENT_ID = os.getenv("CLIENT_ID")
 GUILD_ID_STR = os.getenv("GUILD_ID", "0")
 MONGODB_URI = os.getenv("MONGODB_URI")
-TEMP_VOICE_CATEGORY_ID = int(os.getenv("TEMP_VOICE_CATEGORY_ID", 0))  # Category for temp voice channels
-TEMP_CATEGORY_ID = int(os.getenv("TEMP_CATEGORY_ID", 1486534382314455151))
-INTERFACE_CHANNEL_ID = int(os.getenv("INTERFACE_CHANNEL_ID", 1486552573652631732))
-LOBBY_CHANNEL_ID = int(os.getenv("LOBBY_CHANNEL_ID", 1486535158185197649))
-PORT = int(os.getenv("PORT", 3000))
+TEMP_VOICE_CATEGORY_ID = get_int_env("TEMP_VOICE_CATEGORY_ID", 0)  # Category for temp voice channels
+TEMP_CATEGORY_ID = get_int_env("TEMP_CATEGORY_ID", 1486534382314455151)
+INTERFACE_CHANNEL_ID = get_int_env("INTERFACE_CHANNEL_ID", 1486552573652631732)
+LOBBY_CHANNEL_ID = get_int_env("LOBBY_CHANNEL_ID", 1486535158185197649)
+PORT = get_int_env("PORT", 3000)
 FRONTEND_URL = os.getenv("FRONTEND_URL", f"http://localhost:{PORT}/LEGEND-STAR")
-OWNER_ID = 1406313503278764174
+OWNER_ID = get_int_env("OWNER_ID", 1406313503278764174)
 
 # Async Mongo (motor) for temp voice channel persistence
 if MONGODB_URI:
@@ -918,6 +932,44 @@ GUILD = discord.Object(id=GUILD_ID) if GUILD_ID > 0 else None
 vc_join_times = {}
 cam_timers = {}
 access_panel_view_registered = False
+control_panel_view_registered = False
+tempvoice_panel_message_sent = False
+
+
+def build_control_panel_url(frontend_url: str) -> str:
+    """Normalize the public dashboard URL so the Discord button lands on `/control`."""
+    raw_url = (frontend_url or "").strip()
+    if not raw_url:
+        raw_url = f"http://localhost:{PORT}"
+
+    if not re.match(r"^https?://", raw_url, re.IGNORECASE):
+        raw_url = f"http://{raw_url.lstrip('/')}"
+
+    parsed = urlparse(raw_url)
+    path = parsed.path.rstrip("/")
+    if path.endswith("/control"):
+        control_path = path
+    elif path.endswith("/LEGEND-STAR"):
+        control_path = "/control"
+    elif path:
+        control_path = f"{path}/control"
+    else:
+        control_path = "/control"
+
+    return urlunparse(parsed._replace(path=control_path, params="", query="", fragment=""))
+
+
+def start_loop_once(loop: tasks.Loop, loop_name: str) -> None:
+    """Start a discord task loop only if it is not already running."""
+    if loop.is_running():
+        print(f"⏭️ Background task already running: {loop_name}")
+        return
+
+    try:
+        loop.start()
+        print(f"▶️ Started background task: {loop_name}")
+    except RuntimeError as e:
+        print(f"⚠️ Could not start background task {loop_name}: {e}")
 
 
 def is_strict_camera_channel(channel) -> bool:
@@ -1202,6 +1254,20 @@ async def register_access_panel_view():
         print("✅ Persistent AccessPanelView registered")
     except Exception as e:
         print(f"⚠️ Error registering AccessPanelView: {e}")
+
+
+async def register_control_panel_view():
+    global control_panel_view_registered
+
+    if control_panel_view_registered:
+        return
+
+    try:
+        bot.add_view(ControlPanel())
+        control_panel_view_registered = True
+        print("✅ Persistent ControlPanel view registered")
+    except Exception as e:
+        print(f"⚠️ Error registering ControlPanel view: {e}")
 
 
 class AccessPanelView(discord.ui.View):
@@ -1584,7 +1650,7 @@ spam_cache = defaultdict(list)
 strike_cache = defaultdict(list)
 join_times = defaultdict(list)
 vc_cache = defaultdict(list)
-last_audit_id = None  # Track last processed audit entry to prevent duplicates
+last_general_audit_id = None  # Track last processed audit entry for general audit alerts
 vc_saving = set()  # guard set to prevent concurrent double-saves for a user
 
 from leaderboard import format_time, get_medal_emoji, generate_leaderboard_text, user_rank
@@ -4436,7 +4502,7 @@ async def clean_webhooks():
         print(f"⚠️ [WEBHOOK CLEANUP] General error: {e}")
 
 @tasks.loop(minutes=1)
-async def monitor_audit():
+async def monitor_webhook_audit():
     """Monitors critical server activities like unauthorized webhook creation with enhanced deduplication"""
     if GUILD_ID <= 0:
         return
@@ -4720,8 +4786,8 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
 
 
 @tasks.loop(minutes=1)
-async def monitor_audit():
-    global last_audit_id
+async def monitor_general_audit():
+    global last_general_audit_id
     if GUILD_ID <= 0:
         return
     guild = bot.get_guild(GUILD_ID)
@@ -4731,19 +4797,47 @@ async def monitor_audit():
     if not tech_channel:
         return
     try:
+        pending_entries = []
+        newest_seen_id = last_general_audit_id
+
         async for entry in guild.audit_logs(limit=10):
-            # Stop at last processed entry to avoid duplicates
-            if last_audit_id and entry.id == last_audit_id:
+            if newest_seen_id is None or entry.id > newest_seen_id:
+                newest_seen_id = entry.id
+
+            # Stop once we reach entries from a previous pass.
+            if last_general_audit_id and entry.id <= last_general_audit_id:
                 break
+
+            if entry.user is None:
+                continue
+
             # ✅ WHITELIST: Allow bot, OWNER, and all TRUSTED_USERS (including Sapphire)
             if entry.user.id == bot.user.id or entry.user.id in TRUSTED_USERS:
                 continue
-            if entry.action in [discord.AuditLogAction.role_update, discord.AuditLogAction.channel_update, discord.AuditLogAction.ban, discord.AuditLogAction.kick, discord.AuditLogAction.member_role_update]:
-                # Update last_id ONLY when we have a new action to report
-                if not last_audit_id:
-                    last_audit_id = entry.id
-                embed = discord.Embed(title="⚠️ Audit Alert", description=f"{entry.user} performed {entry.action} on {entry.target}", color=discord.Color.red())
-                await tech_channel.send(embed=embed)
+
+            if entry.action in [
+                discord.AuditLogAction.role_update,
+                discord.AuditLogAction.channel_update,
+                discord.AuditLogAction.ban,
+                discord.AuditLogAction.kick,
+                discord.AuditLogAction.member_role_update,
+            ]:
+                pending_entries.append(entry)
+
+        if last_general_audit_id is None:
+            last_general_audit_id = newest_seen_id
+            return
+
+        for entry in reversed(pending_entries):
+            embed = discord.Embed(
+                title="⚠️ Audit Alert",
+                description=f"{entry.user} performed {entry.action} on {entry.target}",
+                color=discord.Color.red(),
+            )
+            await tech_channel.send(embed=embed)
+
+        if newest_seen_id is not None:
+            last_general_audit_id = max(last_general_audit_id, newest_seen_id)
     except Exception as e:
         print(f"⚠️ Audit monitor error: {str(e)[:80]}")
 
@@ -5111,7 +5205,7 @@ async def control(interaction: discord.Interaction):
         )
         return
 
-    dashboard_url = f"{FRONTEND_URL}/control"
+    dashboard_url = build_control_panel_url(FRONTEND_URL)
     view = discord.ui.View()
     view.add_item(discord.ui.Button(
         label="Open Control Panel",
@@ -5178,6 +5272,8 @@ async def ok_command(interaction: discord.Interaction):
 # ==================== STARTUP ====================
 @bot.event
 async def on_ready():
+    global tempvoice_panel_message_sent
+
     print(f"\n{'='*70}")
     print(f"✅ LEGEND STAR BOT ONLINE")
     print(f"{'='*70}")
@@ -5204,12 +5300,7 @@ async def on_ready():
             print(f"⚠️ MongoDB test failed: {e}")
     
     # Register persistent temp voice controls view (to avoid interaction failure)
-    try:
-        bot.add_view(ControlPanel())
-        print("✅ Persistent ControlPanel view added")
-    except Exception as e:
-        print(f"⚠️ Error adding ControlPanel view: {e}")
-
+    await register_control_panel_view()
     await register_access_panel_view()
 
     # Initialize SQLite spy database
@@ -5239,17 +5330,19 @@ async def on_ready():
     print(f"   🌙 midnight_reset: Daily at 23:59 IST")
     print(f"   ⏰ todo_checker: Every 3 hours")
     print(f"   🔗 clean_webhooks: Every 5 minutes")
-    print(f"   📋 monitor_audit: Every 1 minute")
+    print(f"   🪝 monitor_webhook_audit: Every 1 minute")
+    print(f"   📋 monitor_general_audit: Every 1 minute")
     print(f"{'='*70}\n")
     
-    strict_camera_enforcement_watchdog.start()
-    batch_save_study.start()
-    auto_leaderboard_ping.start()
-    auto_leaderboard.start()
-    midnight_reset.start()
-    todo_checker.start()
-    clean_webhooks.start()
-    monitor_audit.start()
+    start_loop_once(strict_camera_enforcement_watchdog, "strict_camera_enforcement_watchdog")
+    start_loop_once(batch_save_study, "batch_save_study")
+    start_loop_once(auto_leaderboard_ping, "auto_leaderboard_ping")
+    start_loop_once(auto_leaderboard, "auto_leaderboard")
+    start_loop_once(midnight_reset, "midnight_reset")
+    start_loop_once(todo_checker, "todo_checker")
+    start_loop_once(clean_webhooks, "clean_webhooks")
+    start_loop_once(monitor_webhook_audit, "monitor_webhook_audit")
+    start_loop_once(monitor_general_audit, "monitor_general_audit")
     
     # Startup sweep: schedule enforcement for members already in strict camera channels
     try:
@@ -5261,18 +5354,20 @@ async def on_ready():
         print(f"⚠️ Startup sweep error: {e}")
 
     # Send temp voice control panel
-    try:
-        interface_channel = bot.get_channel(INTERFACE_CHANNEL_ID)
-        if interface_channel:
-            await interface_channel.send(
-                "🎛 **Voice Control Panel**\nUse buttons to manage your temp voice channel",
-                view=ControlPanel()
-            )
-            print("✅ Temp voice control panel sent")
-        else:
-            print(f"⚠️ Interface channel {INTERFACE_CHANNEL_ID} not found")
-    except Exception as e:
-        print(f"⚠️ Failed to send control panel: {e}")
+    if not tempvoice_panel_message_sent:
+        try:
+            interface_channel = bot.get_channel(INTERFACE_CHANNEL_ID)
+            if interface_channel:
+                await interface_channel.send(
+                    "🎛 **Voice Control Panel**\nUse buttons to manage your temp voice channel",
+                    view=ControlPanel()
+                )
+                tempvoice_panel_message_sent = True
+                print("✅ Temp voice control panel sent")
+            else:
+                print(f"⚠️ Interface channel {INTERFACE_CHANNEL_ID} not found")
+        except Exception as e:
+            print(f"⚠️ Failed to send control panel: {e}")
 
 # Keep-alive and frontend hosting
 async def handle(_):
