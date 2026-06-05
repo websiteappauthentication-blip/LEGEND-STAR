@@ -39,6 +39,7 @@ import aiosqlite
 import unicodedata
 from urllib.parse import urlparse, urlunparse
 from motor.motor_asyncio import AsyncIOMotorClient
+import io
 
 
 def configure_console_output() -> None:
@@ -5458,7 +5459,7 @@ async def maz(
         try:
             file_bytes = await attachment.read()
             file_to_send = discord.File(
-                fp=discord.utils.io.BytesIO(file_bytes),
+                fp=io.BytesIO(file_bytes),
                 filename=attachment.filename
             )
             file_info = {
@@ -5558,7 +5559,7 @@ async def maz(
                 if attachment:
                     file_bytes = await attachment.read()
                     file_obj = discord.File(
-                        fp=discord.utils.io.BytesIO(file_bytes),
+                        fp=io.BytesIO(file_bytes),
                         filename=attachment.filename
                     )
                     await user.send(message, file=file_obj)
