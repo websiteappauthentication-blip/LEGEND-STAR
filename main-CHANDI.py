@@ -358,7 +358,7 @@ print(f"GUILD_ID from env: {GUILD_ID}")  # DEBUG: Check if set correctly
 # Excluded voice channel ID: do not record cam on/off minutes for this VC
 EXCLUDED_VOICE_CHANNEL_ID = 1466076240111992954
 
-# Strict channels (use integer IDs)
+# Strict channels
 STRICT_CHANNEL_IDS = {1428762702414872636, 1455906399262605457, 1428762820585062522}
 CAMERA_ENFORCEMENT_SECONDS = 180
 
@@ -1540,11 +1540,6 @@ async def _startup_camera_enforcement_legacy(member: discord.Member, channel: di
     """Start the same enforcement flow used for on_voice_state_update for an existing member.
     This allows enforcement to run for users who were already in VC when the bot started.
     """
-    # Check if member has bypass role
-    if has_cam_bypass(member):
-        print(f"✅ [{member.display_name}] CAM BYPASS ROLE DETECTED - Skipping enforcement in {channel.name}")
-        return
-    
     member_id = member.id
     guild_id = member.guild.id
     channel_id = channel.id if channel else None
@@ -2302,18 +2297,9 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     
     channel = after.channel
     if channel and (str(channel.id) in STRICT_CHANNEL_IDS or "Cam On" in channel.name):
-<<<<<<< HEAD
         # Check for bypass role
         if any(role.id == CAMERA_BYPASS_ROLE for role in member.roles):
             print(f"✅ [{member.display_name}] Has CAMERA_BYPASS_ROLE - Enforcement skipped")
-=======
-        # Check if member has bypass role - skip enforcement entirely
-        if has_cam_bypass(member):
-            print(f"✅ [{member.display_name}] HAS CAM BYPASS ROLE - No enforcement needed in {channel.name}")
-            task = cam_timers.pop(member.id, None)
-            if task:
-                task.cancel()
->>>>>>> 0a57982 (fix)
             return
         
         has_cam = after.self_video  # True if camera is on
@@ -2356,11 +2342,6 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                     member_obj = guild.get_member(captured_member_id)
                     channel_obj = guild.get_channel(captured_channel_id) if captured_channel_id else None
 
-                    if member_obj and has_cam_bypass(member_obj):
-                        print(f"✅ [{member_obj.display_name}] CAM BYPASS ROLE DETECTED DURING WARNING PHASE - Cancelling enforcement")
-                        cam_timers.pop(captured_member_id, None)
-                        return
-
                     try:
                         mention = member_obj.mention if member_obj else f"<@{captured_member_id}>"
                         embed = discord.Embed(
@@ -2396,11 +2377,6 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                         print(f"   After refresh - Member: {member_ref.display_name}, Channel: {voice_chan.name}, Cam: {current_cam}")
 
                     if member_ref and voice_chan and (str(voice_chan.id) in STRICT_CHANNEL_IDS or "Cam On" in voice_chan.name):
-                        if has_cam_bypass(member_ref):
-                            print(f"✅ [{member_ref.display_name}] CAM BYPASS ROLE DETECTED DURING FINAL CHECK - Enforcement cancelled")
-                            cam_timers.pop(captured_member_id, None)
-                            return
-
                         if current_cam:
                             print(f"✅ [{member_ref.display_name}] COMPLIED IN TIME - CAM ON detected")
                         else:
@@ -5505,318 +5481,6 @@ async def manual_sync(ctx):
         await ctx.send(f"Sync failed: {e}")
 
 
-# ==================== /MAZ - MASS MESSAGE COMMAND ====================
-# Rate limiting dictionary: {user_id: [timestamp1, timestamp2, ...]}
-maz_rate_limit = defaultdict(list)
-MAZ_RATE_LIMIT_COUNT = 5  # Max 5 messages per
-MAZ_RATE_LIMIT_WINDOW = 60  # 60 seconds
-MAZ_COMMAND_LOG = []  # Store last 50 maz commands
-
-def check_maz_rate_limit(user_id: int) -> bool:
-    """Check if user is within rate limit for /maz command"""
-    now = time.time()
-    # Clean old timestamps (outside window)
-    maz_rate_limit[user_id] = [ts for ts in maz_rate_limit[user_id] if now - ts < MAZ_RATE_LIMIT_WINDOW]
-    
-    # Check limit
-    if len(maz_rate_limit[user_id]) >= MAZ_RATE_LIMIT_COUNT:
-        return False
-    
-    # Add current timestamp
-    maz_rate_limit[user_id].append(now)
-    return True
-
-def log_maz_command(user_id: int, action: str, target_count: int, success: bool):
-    """Log maz command execution"""
-    log_entry = {
-        "timestamp": datetime.datetime.now(KOLKATA).isoformat(),
-        "user_id": user_id,
-        "action": action,
-        "target_count": target_count,
-        "success": success
-    }
-    MAZ_COMMAND_LOG.append(log_entry)
-    # Keep only last 50 entries
-    if len(MAZ_COMMAND_LOG) > 50:
-        MAZ_COMMAND_LOG.pop(0)
-    
-    print(f"📨 [/MAZ LOG] {action} → {target_count} targets | Success: {success} | By: {user_id}")
-
-@tree.command(name="maz", description="Send message to users/role with confirmation", guild=GUILD)
-@app_commands.describe(
-    message="Message to send",
-    targets="Mention users separated by spaces (e.g., @User1 @User2)",
-    role="Send to all members of this role",
-    attachment="Optional file to attach"
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def maz(
-    interaction: discord.Interaction,
-    message: str,
-    targets: str = None,
-    role: discord.Role = None,
-    attachment: discord.Attachment = None
-):
-    """
-    Mass messaging command with verification, rate limiting, and progress tracking.
-    
-    Features:
-    - Send to individual users
-    - Send to multiple users
-    - Send to all members of a role
-    - Include file attachments
-    - Rate limiting (5 messages/60s)
-    - Progress counter for large operations
-    - Logging of all operations
-    - Confirmation modal for safety
-    """
-    
-    # ==================== VERIFICATION & RATE LIMITING ====================
-    user_id = interaction.user.id
-    guild_id = interaction.guild.id
-    
-    # Owner-only verification
-    if user_id != OWNER_ID:
-        return await interaction.response.send_message(
-            "❌ Only the server owner can use this command.",
-            ephemeral=True
-        )
-    
-    # Rate limit check
-    if not check_maz_rate_limit(user_id):
-        return await interaction.response.send_message(
-            f"⏱️ Rate limited! Maximum 5 messages per 60 seconds. Try again later.",
-            ephemeral=True
-        )
-    
-    # Verify sync status
-    if GUILD and GUILD.id > 0:
-        try:
-            synced = await tree.sync(guild=GUILD)
-            print(f"✅ [/MAZ] Sync verified: {len(synced)} commands ready")
-        except Exception as e:
-            print(f"⚠️ [/MAZ] Sync check failed: {e}")
-    
-    # ==================== COLLECT TARGET USERS ====================
-    users = set()
-    
-    # Parse mentions from targets string
-    if targets:
-        # Split by spaces and process each mention
-        parts = targets.split()
-        for part in parts:
-            if part.startswith("<@") and part.endswith(">"):
-                try:
-                    user_id_str = part.replace("<@", "").replace("!", "").replace(">", "")
-                    user_id_int = int(user_id_str)
-                    member = interaction.guild.get_member(user_id_int)
-                    if member:
-                        users.add(member)
-                    else:
-                        # Try to fetch from API
-                        try:
-                            member = await interaction.guild.fetch_member(user_id_int)
-                            users.add(member)
-                        except:
-                            print(f"⚠️ [/MAZ] Could not find member: {user_id_int}")
-                except (ValueError, AttributeError):
-                    print(f"⚠️ [/MAZ] Invalid mention format: {part}")
-    
-    # Add all members of role
-    if role:
-        for member in role.members:
-            if not member.bot:  # Don't message bots
-                users.add(member)
-    
-    # Validate we have targets
-    if not users:
-        log_maz_command(user_id, "maz_attempt", 0, False)
-        return await interaction.response.send_message(
-            "❌ No valid users found. Please mention users or specify a role.",
-            ephemeral=True
-        )
-    
-    # ==================== PREPARE FILE ATTACHMENT ====================
-    file_to_send = None
-    file_info = None
-    
-    if attachment:
-        try:
-            file_bytes = await attachment.read()
-            file_to_send = discord.File(
-                fp=discord.utils.io.BytesIO(file_bytes),
-                filename=attachment.filename
-            )
-            file_info = {
-                "name": attachment.filename,
-                "size": attachment.size,
-                "content_type": attachment.content_type
-            }
-            print(f"📎 [/MAZ] Attachment loaded: {attachment.filename} ({attachment.size} bytes)")
-        except Exception as e:
-            print(f"⚠️ [/MAZ] Failed to load attachment: {e}")
-            file_to_send = None
-    
-    # ==================== CONFIRMATION MODAL ====================
-    user_count = len(users)
-    role_mention = role.mention if role else "N/A"
-    targets_mention = targets if targets else "N/A"
-    
-    confirm_embed = discord.Embed(
-        title="📨 Confirm Mass Message",
-        description="Review the details before sending",
-        color=discord.Color.from_rgb(255, 165, 0),
-        timestamp=discord.utils.utcnow()
-    )
-    confirm_embed.add_field(name="📩 Message", value=f"```{message[:200]}{'...' if len(message) > 200 else ''}```", inline=False)
-    confirm_embed.add_field(name="👥 Target Count", value=f"**{user_count}** members", inline=True)
-    confirm_embed.add_field(name="🎯 Role", value=role_mention, inline=True)
-    confirm_embed.add_field(name="@️ Mentions", value=targets_mention, inline=False)
-    if file_info:
-        confirm_embed.add_field(name="📎 Attachment", value=f"{file_info['name']} ({file_info['size']} bytes)", inline=False)
-    confirm_embed.set_footer(text="Click Confirm to proceed or Cancel to abort")
-    
-    # ==================== CONFIRMATION BUTTONS ====================
-    class ConfirmView(discord.ui.View):
-        def __init__(self, parent_interaction):
-            super().__init__(timeout=30)
-            self.parent_interaction = parent_interaction
-            self.confirmed = False
-        
-        @discord.ui.button(label="✅ Confirm", style=discord.ButtonStyle.green)
-        async def confirm_button(self, button_interaction: discord.Interaction, button: discord.ui.Button):
-            if button_interaction.user.id != user_id:
-                return await button_interaction.response.send_message("❌ Only the command user can confirm.", ephemeral=True)
-            
-            self.confirmed = True
-            await button_interaction.response.defer()
-            self.stop()
-        
-        @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.red)
-        async def cancel_button(self, button_interaction: discord.Interaction, button: discord.ui.Button):
-            if button_interaction.user.id != user_id:
-                return await button_interaction.response.send_message("❌ Only the command user can cancel.", ephemeral=True)
-            
-            self.confirmed = False
-            await button_interaction.response.defer()
-            self.stop()
-    
-    confirm_view = ConfirmView(interaction)
-    
-    await interaction.response.send_message(
-        embed=confirm_embed,
-        view=confirm_view,
-        ephemeral=True
-    )
-    
-    # Wait for confirmation
-    try:
-        await asyncio.wait_for(confirm_view.wait(), timeout=30)
-    except asyncio.TimeoutError:
-        log_maz_command(user_id, "maz_timeout", user_count, False)
-        return await interaction.followup.send(
-            "⏰ Confirmation timed out. Message not sent.",
-            ephemeral=True
-        )
-    
-    if not confirm_view.confirmed:
-        log_maz_command(user_id, "maz_cancelled", user_count, False)
-        return await interaction.followup.send(
-            "❌ Message send cancelled by user.",
-            ephemeral=True
-        )
-    
-    # ==================== SEND MESSAGES WITH PROGRESS ====================
-    await interaction.followup.send(
-        f"📨 Sending message to {user_count} member(s)...",
-        ephemeral=True
-    )
-    
-    sent = 0
-    failed = 0
-    failed_users = []
-    
-    # Send with progress tracking
-    for idx, user in enumerate(users, 1):
-        try:
-            if file_to_send:
-                # Re-read file bytes for each send (discord.File can only be used once)
-                if attachment:
-                    file_bytes = await attachment.read()
-                    file_obj = discord.File(
-                        fp=discord.utils.io.BytesIO(file_bytes),
-                        filename=attachment.filename
-                    )
-                    await user.send(message, file=file_obj)
-                else:
-                    await user.send(message)
-            else:
-                await user.send(message)
-            
-            sent += 1
-            print(f"✅ [/MAZ] Message {idx}/{user_count} sent to {user.name}")
-            
-            # Progress update every 10 messages or at the end
-            if idx % 10 == 0 or idx == user_count:
-                try:
-                    await interaction.followup.send(
-                        f"📊 Progress: {idx}/{user_count} ({(idx/user_count)*100:.0f}%)",
-                        ephemeral=True
-                    )
-                except:
-                    pass
-        
-        except discord.Forbidden:
-            failed += 1
-            failed_users.append(f"{user.name} (DMs closed)")
-            print(f"❌ [/MAZ] Failed - {user.name} has DMs disabled")
-        except Exception as e:
-            failed += 1
-            failed_users.append(f"{user.name} ({str(e)[:30]})")
-            print(f"❌ [/MAZ] Error sending to {user.name}: {str(e)[:50]}")
-    
-    # ==================== FINAL REPORT ====================
-    log_maz_command(user_id, "maz_complete", user_count, True)
-    
-    # Create result embed
-    result_embed = discord.Embed(
-        title="📨 Mass Message Complete",
-        color=discord.Color.green() if failed == 0 else discord.Color.gold(),
-        timestamp=discord.utils.utcnow()
-    )
-    result_embed.add_field(name="✅ Sent", value=f"**{sent}** successful", inline=True)
-    result_embed.add_field(name="❌ Failed", value=f"**{failed}** failed", inline=True)
-    result_embed.add_field(name="👥 Total", value=f"**{user_count}** members", inline=True)
-    result_embed.add_field(name="📊 Success Rate", value=f"**{(sent/user_count)*100:.1f}%**", inline=False)
-    
-    if failed_users:
-        failed_list = "\n".join(failed_users[:10])  # Show first 10
-        if len(failed_users) > 10:
-            failed_list += f"\n... and {len(failed_users) - 10} more"
-        result_embed.add_field(name="⚠️ Failed Users", value=failed_list, inline=False)
-    
-    result_embed.set_footer(text=f"Command executed by {interaction.user.name}")
-    
-    await interaction.followup.send(embed=result_embed, ephemeral=True)
-    
-    # Send summary to tech channel for audit
-    try:
-        tech_channel = bot.get_channel(TECH_CHANNEL_ID)
-        if tech_channel:
-            audit_embed = discord.Embed(
-                title="📨 /MAZ Command Audit Log",
-                color=discord.Color.blue(),
-                timestamp=discord.utils.utcnow()
-            )
-            audit_embed.add_field(name="👤 Executed By", value=f"{interaction.user.mention} ({interaction.user.id})", inline=False)
-            audit_embed.add_field(name="📩 Message", value=f"```{message[:150]}{'...' if len(message) > 150 else ''}```", inline=False)
-            audit_embed.add_field(name="📊 Results", value=f"Sent: {sent}/{user_count} | Failed: {failed}", inline=True)
-            audit_embed.add_field(name="📎 Attachment", value=file_info['name'] if file_info else "None", inline=True)
-            await tech_channel.send(embed=audit_embed)
-    except Exception as e:
-        print(f"⚠️ [/MAZ] Failed to send audit log: {e}")
-
-
 @tree.command(name="accesspanel", description="Deploy the access panel for new members", guild=GUILD)
 async def accesspanel(interaction: discord.Interaction):
     # Check administrator permissions
@@ -6007,35 +5671,10 @@ async def on_ready():
     try:
         if GUILD_ID > 0:
             guild = bot.get_guild(GUILD_ID)
-<<<<<<< HEAD
             if guild:
                 await ensure_camera_enforcement_for_guild(guild, source="startup")
     except Exception as e:
         print(f"⚠️ Startup sweep error: {e}")
-=======
-            if guild:
-                for cid in STRICT_CHANNEL_IDS:
-                    try:
-                        ch = guild.get_channel(int(cid))
-                        if not ch:
-                            continue
-                        for m in ch.members:
-                            if m.bot:
-                                continue
-                            # Check if member has bypass role
-                            if has_cam_bypass(m):
-                                print(f"✅ [{m.display_name}] HAS CAM BYPASS ROLE - Skipping enforcement in {ch.name}")
-                                continue
-                            # if camera off and no timer yet, start enforcement
-                            has_cam = m.voice.self_video if m.voice else False
-                            if not has_cam and m.id not in cam_timers:
-                                print(f"🔎 Scheduling startup enforcement for {m.display_name} in {ch.name}")
-                                await start_camera_enforcement_for(m, ch)
-                    except Exception:
-                        continue
-    except Exception as e:
-        print(f"⚠️ Startup sweep error: {e}")
->>>>>>> 0a57982 (fix)
 
     # Send temp voice control panel
     if not tempvoice_panel_message_sent:
