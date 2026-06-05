@@ -1129,8 +1129,6 @@ cam_timers = {}
 access_panel_view_registered = False
 control_panel_view_registered = False
 tempvoice_panel_message_sent = False
-
-
 def build_control_panel_url(frontend_url: str) -> str:
     """Normalize the public dashboard URL so the Discord button lands on `/control`."""
     raw_url = (frontend_url or "").strip()
@@ -3291,6 +3289,52 @@ async def on_member_join(member: discord.Member):
             )
         except Exception:
             pass
+    # Assign a default member role and send welcome DM for human users only
+    # Skip bot accounts, system accounts, and any webhook-like accounts
+    if not (getattr(member, "bot", False) or getattr(member, "system", False) or getattr(member, "webhook", False)):
+        ROLE_ID = 1457931098171506719
+        try:
+            role = member.guild.get_role(ROLE_ID)
+        except Exception:
+            role = None
+
+        if role:
+            try:
+                await member.add_roles(role, reason="Automatic role assignment on join")
+                print(f"Role added to {member.name}")
+            except Exception as e:
+                print(f"Role Error: {e}")
+
+        welcome_message = f"""
+🎉 Welcome {member.mention}!
+
+🔱 Welcome to **NEET / JEE / UPSC / Competitive Examinations
+🔱 ADYAANANT EMPIRE 🔱**
+
+📚 Here you'll find:
+• NEET Preparation
+• JEE Preparation
+• UPSC Guidance
+• Competitive Exam Resources
+• Study Materials
+• Mock Tests & Discussions
+
+✅ Your member role has been assigned automatically.
+
+We wish you success in your exam journey!
+
+🔥 Stay Active
+📖 Keep Learning
+🏆 Achieve Your Goals
+
+— 🔱 ADYAANANT EMPIRE 🔱
+"""
+
+        try:
+            await member.send(welcome_message)
+        except discord.Forbidden:
+            print(f"Could not DM {member.name}")
+
     if member.bot and member.id not in WHITELISTED_BOTS:
         audit_entry = await find_matching_audit_entry(
             member.guild,
